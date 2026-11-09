@@ -1,0 +1,22 @@
+{
+  "name": "durableflow",
+  "version": "0.1.0",
+  "description": "A persistent SQLite job queue with leased, at-least-once delivery.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "exports": "./src/index.js",
+  "files": [
+    "src",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node scripts/check.js",
+    "example": "node examples/basic.js"
+  }
+}
