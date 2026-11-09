@@ -1,13 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { LeaseLostError } from './errors.js';
 
-export class LeaseLostError extends Error {
-  constructor(jobId) {
-    super(`Job ${jobId} has no matching, unexpired lease`);
-    this.name = 'LeaseLostError';
-    this.jobId = jobId;
-  }
-}
+export { LeaseLostError, ShutdownTimeoutError } from './errors.js';
+export { Worker, exponentialBackoff } from './worker.js';
 
 function integer(value, name, minimum = 0) {
   if (!Number.isSafeInteger(value) || value < minimum) {
@@ -195,6 +191,22 @@ export class Queue {
     });
   }
 
+  renew(id, leaseToken, { leaseMs = 30_000 } = {}) {
+    text(id, 'id');
+    text(leaseToken, 'leaseToken');
+    integer(leaseMs, 'leaseMs', 1);
+    return this.#transaction(() => {
+      const now = this.#now();
+      const expiresAt = integer(now + leaseMs, 'leaseExpiresAt');
+      const result = this.#db.prepare(`
+        UPDATE jobs SET lease_expires_at = MAX(lease_expires_at, ?), updated_at = ?
+        WHERE id = ? AND status = 'active' AND lease_token = ? AND lease_expires_at > ?
+      `).run(expiresAt, now, id, leaseToken, now);
+      if (result.changes !== 1) throw new LeaseLostError(id);
+      return this.#read(id);
+    });
+  }
+
   fail(id, leaseToken, error, { retryDelayMs = 0 } = {}) {
     text(id, 'id');
     text(leaseToken, 'leaseToken');
@@ -221,6 +233,32 @@ export class Queue {
       UPDATE jobs SET status = 'cancelled', updated_at = ?
       WHERE id = ? AND status = 'pending'
     `).run(this.#now(), id).changes === 1);
+  }
+
+  failed({ limit = 100 } = {}) {
+    integer(limit, 'limit', 1);
+    if (limit > 1000) throw new RangeError('limit must be <= 1000');
+    return this.#db.prepare(`
+      SELECT * FROM jobs WHERE status = 'failed'
+      ORDER BY updated_at, rowid LIMIT ?
+    `).all(limit).map(job);
+  }
+
+  retryFailed(id, { maxAttempts, delayMs = 0 } = {}) {
+    text(id, 'id');
+    if (maxAttempts !== undefined) integer(maxAttempts, 'maxAttempts', 1);
+    integer(delayMs, 'delayMs');
+    return this.#transaction(() => {
+      const now = this.#now();
+      const availableAt = integer(now + delayMs, 'availableAt');
+      const result = this.#db.prepare(`
+        UPDATE jobs SET status = 'pending', attempts = 0,
+          max_attempts = COALESCE(?, max_attempts), available_at = ?,
+          last_error = NULL, updated_at = ?
+        WHERE id = ? AND status = 'failed'
+      `).run(maxAttempts ?? null, availableAt, now, id);
+      return result.changes === 1 ? this.#read(id) : null;
+    });
   }
 
   get(id) {

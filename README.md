@@ -1,9 +1,10 @@
 # DurableFlow
 
 An original, dependency-free Node.js job queue using built-in `node:sqlite`.
-The **persistent-queue** milestone is implemented: persisted JSON jobs,
+The **persistent-queue** and **worker-lifecycle** milestones are implemented: persisted JSON jobs,
 idempotent enqueue, competing claims, fenced leases, acknowledgement, expiry
-recovery, bounded retries, and cancellation of pending work.
+recovery, bounded retries, cancellation of pending work, concurrent workers,
+lease heartbeats, graceful shutdown, and explicit dead-letter replay.
 
 **Delivery is at least once, not exactly once.** A process can perform an
 external effect and crash before acknowledgement. Its job can then run again.
@@ -21,6 +22,7 @@ Requires Node.js 24+ and npm. No external packages or services are required.
 npm test
 npm run check
 npm run example
+npm run example:worker
 ```
 
 The example creates `durableflow-example.db` in the current directory and
@@ -68,9 +70,12 @@ Separate processes or threads can open the same local database file.
 | `enqueue(type, payload, options?)` | Returns the persisted job. Options: `idempotencyKey` (default `null`), `maxAttempts` (default 3), `delayMs` (default 0). Payload uses JSON serialization; unsupported top-level values, cycles, and BigInt throw. |
 | `claim({ leaseMs = 30000 }?)` | Recovers expired leases, then atomically claims one due job or returns `null`. Increments attempts and issues a fresh random lease token. |
 | `ack(id, leaseToken)` | Completes work only with the current unexpired token; otherwise throws `LeaseLostError`. Returns the updated job. |
+| `renew(id, leaseToken, { leaseMs = 30000 }?)` | Extends an unexpired matching lease without shortening it. Cannot resurrect an expired lease. |
 | `fail(id, leaseToken, error, { retryDelayMs = 0 }?)` | Accepts an Error or nonempty string. Requeues work if attempts remain; otherwise marks it failed. Requires the current unexpired token. Returns the updated job. |
 | `recoverExpired()` | Requeues expired active jobs with attempts remaining; marks exhausted jobs failed. Returns the number changed. |
 | `cancel(id)` | Cancels only pending work, including delayed retries. Returns `false` for missing, active, or terminal jobs; never interrupts a running handler. |
+| `failed({ limit = 100 }?)` | Lists up to 1000 failed jobs in update order for dead-letter inspection. |
+| `retryFailed(id, { maxAttempts, delayMs = 0 }?)` | Explicitly requeues a failed job with a fresh attempt budget, preserving its ID and enqueue key. Returns `null` if it is not failed. Clears the previous error; this is not an audit log. |
 | `get(id)` | Returns a job snapshot or `null`. Does not automatically recover expired work. |
 | `close()` | Closes this connection; call once when finished. Does not release active leases. |
 
@@ -113,11 +118,60 @@ non-finite numbers becoming `null`.
   A crash around commit can leave a caller uncertain whether it succeeded:
   retry enqueue with the same key and inspect persisted state.
 
-## Scope and development
+## Worker lifecycle
 
-Not implemented: a worker loop, handler registry, lease renewal, automatic
-backoff, dead-letter replay, job pruning, metrics, distributed storage, or a
-dashboard. Applications drive claiming/recovery and supply their handlers.
+```js
+import { Queue, Worker } from './src/index.js';
+
+const queue = new Queue('jobs.db');
+const stop = new AbortController();
+process.once('SIGINT', () => stop.abort());
+const worker = new Worker(queue, {
+  receipt: async (job, { signal }) => {
+    signal.throwIfAborted();
+    await sendReceiptIdempotently(job.payload, job.id, { signal });
+  },
+}, { concurrency: 4, leaseMs: 30000, heartbeatMs: 10000 });
+try {
+  console.log(await worker.run({ signal: stop.signal }));
+} finally {
+  queue.close();
+}
+```
+
+`sendReceiptIdempotently` above is your application handler, not a supplied
+function. `npm run example:worker` is the complete offline runnable example.
+
+Workers claim no more than `concurrency` jobs at a time (default 4, maximum
+1000). This is async I/O concurrency, not parallel CPU execution. Handlers are
+registered by job type; an unknown type fails using the same retry budget.
+Each worker instance runs once and does not own or close the queue.
+
+Aborting `run`'s signal stops new claims while existing handlers drain.
+Heartbeats continue during draining. After `shutdownTimeoutMs` (default 30000),
+unfinished handler signals are aborted and the worker stops waiting for them.
+Their leases are left to expire rather than falsely acknowledged or failed.
+Handler cancellation is cooperative: ignored signals cannot stop external
+effects or prevent duplicate execution. Resolve/close external resources in
+handlers; use a separate process for untrusted or CPU-bound work.
+
+A missed/expired heartbeat aborts the affected handler and fences all stale
+queue mutations. Other storage errors stop the worker and reject `run`;
+inspect persisted state before restarting. A blocked event loop or SQLite
+operation can delay both heartbeats and shutdown timers, so this is not a
+hard real-time deadline.
+
+Default retry delays grow exponentially from 1000 ms, with +/-20% jitter and
+a 60000 ms cap. `exponentialBackoff({ baseMs, maxMs, jitter, random })` produces
+an injectable policy. The cap applies after jitter; attempt 1 is the first
+failure. `retryDelay(attempt)` may be supplied instead. Queue clocks and the
+worker's abort-aware `wait(ms, signal)` can be injected for deterministic tests.
+`run` returns counts for completed, retried, failed, lease-lost, and abandoned
+jobs; these are per invocation, not persistent metrics.
+
+## Remaining scope
+
+Not implemented: job pruning, metrics, distributed storage, or a dashboard.
 This is a small queue engine, not a production-readiness or throughput claim.
 
 Tests use temporary databases, independent worker processes for competing

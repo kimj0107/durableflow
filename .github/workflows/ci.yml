@@ -19,3 +19,4 @@ jobs:
       - run: npm test
       - run: npm run check
       - run: npm pack --dry-run --ignore-scripts
+      - run: npm run smoke:package --if-present
